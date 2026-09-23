@@ -5,6 +5,7 @@
 #include "daemon/host_internal.h"
 
 #include "daemon/application.h"
+#include "daemon/bootstrap.h"
 #include "daemon/runtime.h"
 #include "daemon/project_lock.h"
 #include "daemon/version_cohort.h"
@@ -16,6 +17,8 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/secure_random.h"
+#include "foundation/sha256.h"
 #include "mcp/index_supervisor.h"
 #include "store/store.h"
 #include "ui/config.h"
@@ -24,6 +27,7 @@
 #include "watcher/watcher.h"
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +101,7 @@ struct host_state {
     uint32_t http_retry_delay_ms;
     uint32_t http_largest_scheduled_retry_ms;
     const host_http_ops_t *http_ops;
+    uint8_t ui_readiness_secret[CBM_SHA256_DIGEST_LEN];
 };
 
 static FILE *g_host_log_file = NULL;
@@ -140,6 +145,18 @@ static bool host_log_open(char conflict_log_out[HOST_PATH_CAP]) {
     g_host_log_mutex_initialized = true;
     cbm_log_set_sink(host_log_sink);
     return true;
+}
+
+/* #1828: a detached daemon has no stderr; its start failure must reach the
+ * client that is waiting for it, or that client burns its whole deadline and
+ * reports the opposite of the truth. */
+static void host_start_failure_record(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                      const char *component) {
+    char logs[HOST_PATH_CAP];
+    if (!cbm_daemon_bootstrap_log_directory(logs, sizeof(logs)) ||
+        !cbm_daemon_bootstrap_start_failure_record(logs, endpoint, component)) {
+        cbm_log_error("daemon.start_failure_record_failed", "component", component);
+    }
 }
 
 static void host_log_close(void) {
@@ -333,6 +350,7 @@ static void host_http_server_configure_default(void *context, cbm_http_server_t 
     cbm_http_server_set_index_executor(server, host_ui_index, host);
     cbm_http_server_set_project_mutation_guard(server, host_ui_mutation_begin, host_ui_mutation_end,
                                                host);
+    cbm_http_server_set_readiness_secret(server, host->ui_readiness_secret);
 }
 
 static void host_http_server_stop_default(void *context, cbm_http_server_t *server) {
@@ -557,11 +575,16 @@ static void host_state_free(host_state_t *host) {
         host_cleanup_release_until_complete(host_project_lock_manager_free_once,
                                             &host->project_locks, "project_lock_manager_cleanup");
     }
+    cbm_secure_zero(host->ui_readiness_secret, sizeof(host->ui_readiness_secret));
 }
 
 static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint_t *endpoint) {
     host->http_ops = &g_host_http_default_ops;
     host->http_assets_available = CBM_EMBEDDED_FILE_COUNT > 0;
+    if (!cbm_secure_random(host->ui_readiness_secret, sizeof(host->ui_readiness_secret))) {
+        cbm_log_error("daemon.readiness_secret_failed", "reason", "system_rng_unavailable");
+        return false;
+    }
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     const char *cache = cbm_resolve_cache_dir();
     if (!cache || !cache[0]) {
@@ -573,20 +596,40 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
         return false;
     }
-    host->watch_store = cbm_store_open_memory();
     host->project_locks = cbm_project_lock_manager_new(endpoint);
-    host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
+    /* #335: watcher_enabled (default true) is the master switch for the
+     * background watcher. When false the daemon never builds the watcher or the
+     * in-memory store backing it, so the poll thread never starts
+     * (host_background_start has nothing to run) and no project ever registers
+     * (register_watcher_if_enabled early-returns on a NULL watcher). The daemon
+     * still starts and still owns everything else: IPC, HTTP/UI, project locks,
+     * and manual index_repository. Read once here at daemon startup, so a change
+     * takes effect when the daemon next starts — see docs/CONFIGURATION.md. */
+    bool watcher_enabled = cbm_config_watcher_enabled(host->runtime_config);
+    if (watcher_enabled) {
+        host->watch_store = cbm_store_open_memory();
+        host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
+    } else {
+        cbm_log_info("watcher.disabled", "reason", "config");
+    }
     cbm_daemon_application_config_t application_config = {
         .watcher = host->watcher,
         .config = host->runtime_config,
         .aggregate_memory_budget_bytes = aggregate_memory_budget_bytes,
         .project_locks = host->project_locks,
+        .ui_readiness_secret = host->ui_readiness_secret,
+        .ui_readiness_secret_length = sizeof(host->ui_readiness_secret),
     };
     host->application = cbm_daemon_application_new(&application_config);
     if (host->application && host->permanent) {
         cbm_daemon_application_set_permanent(host->application, true);
     }
-    if (!host->watch_store || !host->watcher || !host->project_locks || !host->application) {
+    if (!host->project_locks || !host->application) {
+        return false;
+    }
+    /* A watcher deliberately left unbuilt by watcher_enabled=false is not a
+     * startup failure; an allocation failure while it is enabled still is. */
+    if (watcher_enabled && (!host->watch_store || !host->watcher)) {
         return false;
     }
     return true;
@@ -812,10 +855,14 @@ bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void) {
 }
 
 static bool host_background_start(host_state_t *host) {
-    if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
-        return false;
+    /* No watcher object when watcher_enabled=false (#335) — nothing to run, and
+     * the daemon must still come up with its remaining subsystems. */
+    if (host->watcher) {
+        if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
+            return false;
+        }
+        host->watcher_started = true;
     }
-    host->watcher_started = true;
 
     host_http_reconcile_at(host, cbm_now_ms(), true);
     return true;
@@ -857,6 +904,10 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
+        /* Retire an ephemeral generation that lingered for cold-storm cohort
+         * participants once they drain, or once its bounded linger elapses.
+         * A no-op unless a cohort-participant hook armed a linger. */
+        cbm_daemon_runtime_service_reconcile_lifetime(service);
         (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
     }
 }
@@ -1017,10 +1068,16 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     };
     cbm_daemon_runtime_service_t *service =
         cbm_daemon_runtime_service_start_reserved(&runtime_config, &lifetime_reservation);
+    if (!service) {
+        cbm_log_error("daemon.start_failed", "component", "runtime");
+        /* Recorded while the lifetime reservation is still held: a client
+         * that watches this generation vanish finds the cause already there
+         * and never launches a doomed replacement. */
+        host_start_failure_record(config->endpoint, "runtime");
+    }
     cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
     lifetime_reservation = NULL;
     if (!service) {
-        cbm_log_error("daemon.start_failed", "component", "runtime");
         host_state_free(&host);
         host_log_close();
         host_participant_guard_close(&participant_guard);

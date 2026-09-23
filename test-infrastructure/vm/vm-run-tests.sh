@@ -45,8 +45,86 @@ case "${1:-}" in
 -h | --help) usage; exit 0 ;;
 esac
 
+# The leg's verdict, as a function so the contract test can drive the REAL
+# logic with synthetic logs instead of a copy of it that can drift
+# (tests/test_vm_verdict_contract.sh). See the two-channel note at the call
+# site for why the log outranks the exit status.
+# `mode` is "full" for the whole venue leg and "iteration" for a named subset of
+# suites. Only the full leg prints the completion marker, because only the full
+# leg HAS an end to reach: scripts/test.sh --suites finishes after the suites it
+# was given and says nothing more. Requiring the marker in both modes made every
+# `win.sh test <suites>` run report failure while passing -- 23 passed, 1
+# skipped, rc=0, called red. A guard against false greens is not allowed to
+# invent false reds.
+vm_verdict() {
+    local log="$1"
+    local rc="$2"
+    local mode="${3:-full}"
+    if ! grep -Eq '[0-9]+ passed' "$log"; then
+        echo "GUARD: test runner produced no completion summary — the suites did" \
+            "not validly run; treating as failure (runner rc=$rc)" >&2
+        return 90
+    fi
+    local failed_total
+    local complete
+    failed_total=$(grep -Eo '[0-9]+ failed' "$log" | grep -Eo '^[0-9]+' |
+        awk '{s += $1} END {print s + 0}')
+    complete=$(grep -c '=== All tests passed ===' "$log")
+    if [ "${failed_total:-0}" -gt 0 ]; then
+        echo "GUARD: the log reports $failed_total failed test(s) (runner rc=$rc)" >&2
+        return 1
+    fi
+    if [ "$mode" = "full" ] && [ "$complete" -eq 0 ]; then
+        echo "GUARD: the log has a summary but no completion marker — the leg" \
+            "stopped before the end (runner rc=$rc)" >&2
+        return 1
+    fi
+    if [ "$mode" != "full" ] && [ "${rc:-1}" -ne 0 ]; then
+        # No marker to lean on here, so a non-zero status is the only evidence
+        # that the run ended badly after its last summary line. Iteration mode
+        # is a developer tool, not a gate, so it obeys rc rather than overriding
+        # it the way the full leg does.
+        echo "GUARD: suites reported no failures but the run exited $rc" >&2
+        return 1
+    fi
+    if [ "${rc:-1}" -ne 0 ]; then
+        echo "GUARD: every suite passed and the run completed, but the exit status" \
+            "came back as $rc — the ssh/msys2_shell chain lost it. Reporting the" \
+            "log's verdict; see the two-channel note in vm-run-tests.sh." >&2
+    fi
+    return 0
+}
+
+# Verdict-only mode for the contract test: decide a log WITHOUT a VM.
+if [ "${1:-}" = "--verdict" ]; then
+    if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+        echo "usage: vm-run-tests.sh --verdict <log> <rc> [full|iteration]" >&2
+        exit 2
+    fi
+    vm_verdict "$2" "$3" "${4:-full}"
+    exit $?
+fi
+
 RUNNER="${CBM_VM_RUNNER:-}"
-LOG="${CBM_VM_TEST_LOG:-/tmp/win-test.log}"
+
+# Per-run identity. The VM holds ONE checkout (/c/cbm), so two concurrent runs
+# shared a FIXED log path and the same build dir: the later run's output
+# replaced the earlier one's, and -PruneStale could delete a live run's temp
+# root out from under it. The run id namespaces the log and the build dir; the
+# protected temp root is already unique per run.
+CALLER_RUN_ID="${CBM_CI_RUN_ID:-}"
+RUN_ID="${CBM_CI_RUN_ID:-$$-$(date +%s)}"
+export CBM_CI_RUN_ID="$RUN_ID"
+LOG="${CBM_VM_TEST_LOG:-/tmp/win-test-${RUN_ID}.log}"
+
+# A caller that sets CBM_CI_RUN_ID is declaring concurrency, so give that run
+# its own BUILD_DIR; the default single-run path keeps the shared one and its
+# incremental reuse (a per-run build dir on the VM costs a full rebuild).
+if [ -n "$CALLER_RUN_ID" ]; then
+    BUILD_ARGS=("BUILD_DIR=build/vm-${RUN_ID}")
+else
+    BUILD_ARGS=()
+fi
 
 [ $# -ge 1 ] || { echo "vm-run-tests: missing arguments. Please consult --help." >&2; exit 2; }
 if [ "$1" = "--soak" ]; then
@@ -130,11 +208,23 @@ if [ -n "$RUNNER" ]; then
         rc="${PIPESTATUS[0]}"
     fi
 elif [ "$1" = "--par" ]; then
-    scripts/test.sh CC=clang CXX=clang++ 2>&1 | tee "$LOG"
+    scripts/test.sh CC=clang CXX=clang++ \
+        ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
 else
-    scripts/test.sh --suites "$*" CC=clang CXX=clang++ 2>&1 | tee "$LOG"
+    scripts/test.sh --suites "$*" CC=clang CXX=clang++ \
+        ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
+fi
+
+# Tidy this run's own build dir on success; keep it on failure as the
+# post-mortem. Only ever touches a dir this run created (concurrent mode).
+if [ -n "$CALLER_RUN_ID" ] && [ "${CBM_CI_KEEP:-0}" != "1" ]; then
+    if [ "${rc:-1}" -eq 0 ]; then
+        rm -rf "build/vm-${RUN_ID}"
+    else
+        echo "vm-run-tests: kept build/vm-${RUN_ID} and $LOG for post-mortem" >&2
+    fi
 fi
 
 if ! grep -Eq '[0-9]+ passed' "$LOG"; then
@@ -142,4 +232,20 @@ if ! grep -Eq '[0-9]+ passed' "$LOG"; then
          "not validly run; treating as failure (runner rc=$rc)" >&2
     exit 90
 fi
-exit "$rc"
+
+# TWO independent channels decide this leg, because neither is trustworthy
+# alone. The exit status travels ssh -> cmd.exe -> msys2_shell.cmd, and that
+# chain loses it: on 2026-09-18 a leg that printed "7925 passed, 0 failed" and
+# "=== All tests passed ===" still exited 1, while the identical work run
+# through win.sh's other entry reported 0. A channel that can turn 0 into 1 can
+# turn 1 into 0 — and THAT direction is a false green, a red Windows leg
+# reported as passing, which is the failure this guard exists to prevent.
+#
+# So the LOG decides the test outcome (the runner writes it locally; it cannot
+# be mangled in transit) and rc decides what the log cannot see. Green requires
+# zero reported failures AND, for the full leg, the completion marker that
+# scripts/test.sh prints as its last statement — a leg that stopped early has a
+# summary but no marker. A named subset of suites prints no marker at all, so it
+# is judged on its summaries and its exit status instead.
+vm_verdict "$LOG" "$rc" "$([ "$1" = "--par" ] && echo full || echo iteration)"
+exit $?

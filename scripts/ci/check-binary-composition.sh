@@ -3,26 +3,37 @@
 # shipped artifact.
 #
 # Microsoft Defender's ML classifier flagged the v0.9.1-rc.1 binaries. The
-# hardening pass that followed *removed capability* — an executable stack, an
-# in-process updater, test-only environment seams, the embedded HTTP/UI server
-# and its process enumerator in the standard build. Each of those regresses
-# invisibly: one restored #include, one Makefile source list edit, one revived
-# call site, and nothing else in CI notices — the binary just quietly gets its
-# malware-shaped surface back and the next release gets flagged again.
+# hardening pass that followed removed capability or opaque asset bytes — an
+# executable stack, an in-process updater, test-only environment seams,
+# embedded integration programs, and the in-image frontend bundle. Each of
+# those regresses invisibly: one restored #include, one Makefile source-list
+# edit, one revived call site, and nothing else in CI notices — the binary just
+# quietly restores capability or opaque bytes that this hardening boundary is
+# intended to exclude. Their removal reduces attack surface and makes release
+# contents independently inspectable; it does not establish which feature, if
+# any, caused an opaque third-party ML verdict.
 #
-# This script is the proof that each removal stayed removed. It asserts only
-# NEGATIVE properties (needle absent), plus one canary string we know ships,
-# because an absence check aimed at the wrong file — a compressed artifact, a
-# stub, a truncated download — would otherwise pass vacuously and read green.
-# A missing tool is a hard error for the same reason: a skipped assertion must
-# never look like a satisfied one.
+# This script is the proof that each removal stayed removed. The needle scans
+# assert NEGATIVE properties (needle absent), plus one canary string we know
+# ships, because an absence check aimed at the wrong file — a compressed
+# artifact, a stub, a truncated download — would otherwise pass vacuously and
+# read green. The A1* checks assert structural properties of the produced ELF
+# instead, for the mirror-image reason: a linker flag that was accepted is not
+# evidence that the binary gained anything, so the mitigation is measured in
+# the artifact. A missing tool is a hard error on both sides: a skipped
+# assertion must never look like a satisfied one.
 #
-# Usage: scripts/ci/check-binary-composition.sh [--variant=auto|standard|ui] <binary-or-dir>...
+# Usage: scripts/ci/check-binary-composition.sh <binary-or-dir>...
 #   Directories are scanned recursively; format (ELF / Mach-O / PE) is detected
 #   per file from its magic bytes and each assertion runs where it is
 #   meaningful. Exit 0 = every assertion passed, 1 = at least one failed,
 #   2 = usage error, missing tool, or nothing checkable was found (a vacuous
 #   run is a failure, not a pass).
+#   CBM_COMPOSITION_FIXTURE=1 declares the target a packaging FIXTURE (a stub
+#   compiled by a contract test, not a release link): A1d-bind-now is then
+#   reported n/a instead of asserted, because eager binding is a property of
+#   the release link flags, not of the packaging path the fixture exercises.
+#   Only contract tests set it; release derivation never does.
 set -euo pipefail
 
 case "${1:-}" in
@@ -39,16 +50,18 @@ esac
 
 # S6: worker/Windows test seams read these env vars. A release binary that
 # still honours them lets any process on the box steer the indexer's child
-# processes and file placement — and CBM_TEST_* in a shipped binary is exactly
-# the "debug/injection hooks" shape AV heuristics score on.
+# processes and file placement. Their absence is a release-security boundary;
+# no claim is made about whether a third-party classifier weighs them.
 SEAM_NEEDLES=(
     'CBM_TEST_WORKER_DESCENDANT_PID_FILE'
-    'CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
+    'CBM_TEST_CRASH_ON'
+    'CBM_TEST_HANG_ON'
 )
 
-# The in-process updater (download-and-replace-own-binary) is the single most
-# malware-shaped behaviour we ever shipped; updates now run from install.sh
-# out-of-process. These four needles cover both halves of what was removed:
+# The in-process updater combined network download with replacement of its own
+# executable. That dual-use behavior is no longer needed in the daemon; updates
+# now run from install.sh out-of-process. These four needles cover both halves
+# of what was removed:
 # the download base URL, the checksum URL built on top of it, the GitHub API
 # release query of the daemon's background version check, and that request's
 # Accept header (which survives even if the URL is ever assembled at runtime).
@@ -62,9 +75,10 @@ UPDATER_NEEDLES=(
 # SQLite loadable extensions = arbitrary code execution through a database
 # file. The amalgamation is built with SQLITE_OMIT_LOAD_EXTENSION; if that ever
 # drops out, dlopen()/LoadLibrary() re-enters the store layer.
-# NOTE: release binaries are stripped, so the two API symbol names only appear
-# when the surface is *exported*. The dlopen error text is the needle that
-# still works on a stripped build — it is compiled in only when the feature is.
+# NOTE: the stripped release candidate can erase non-exported symbol names, so
+# the two API names are not a sufficient proof on their own. The dlopen error
+# text still works after stripping — it is compiled in only with the feature.
+# When the unstripped candidate is inspected, the symbol checks are stronger.
 SQLITE_LOADEXT_NEEDLES=(
     'sqlite3_load_extension'
     'sqlite3_enable_load_extension'
@@ -72,8 +86,8 @@ SQLITE_LOADEXT_NEEDLES=(
 )
 
 # The standard artifact must not contain the UI's HTTP server at all: an
-# unauthenticated localhost listener plus a process enumerator is precisely the
-# behaviour pair a classifier reads as a backdoor. Needles are split across
+# unauthenticated localhost listener plus a process enumerator is unnecessary
+# capability in the standard composition. Needles are split across
 # both UI translation units and are independent of each other, so a refactor of
 # any single one cannot silently disarm the assertion:
 #   'HTTP/1.1 %d %s'                  httpd.c response-status writer
@@ -99,11 +113,9 @@ UI_HTTP_NEEDLES=(
 CANARY_NEEDLE='codebase-memory-mcp'
 
 # ── Args ────────────────────────────────────────────────────────────
-VARIANT=auto
 TARGETS=()
 for arg in "$@"; do
     case "$arg" in
-    --variant=*) VARIANT="${arg#--variant=}" ;;
     -*)
         echo "FAIL: unknown flag $arg (see --help)" >&2
         exit 2
@@ -111,13 +123,6 @@ for arg in "$@"; do
     *) TARGETS+=("$arg") ;;
     esac
 done
-case "$VARIANT" in
-auto | standard | ui) ;;
-*)
-    echo "FAIL: --variant must be auto, standard or ui (got '$VARIANT')" >&2
-    exit 2
-    ;;
-esac
 if [ "${#TARGETS[@]}" -eq 0 ]; then
     echo "FAIL: no binaries or directories given (see --help)" >&2
     exit 2
@@ -151,6 +156,29 @@ resolve_elf_reader() {
 
 # Echoes the GNU_STACK flag field ("RWE", "RW", "rwx", "rw-"), empty if the
 # header is absent or unparseable.
+exec_load_bytes() {
+    # Total size of PT_LOAD segments carrying the execute bit. With
+    # -z separate-code the executable segment holds only code; without it the
+    # linker merges .rodata in, so this number balloons to nearly the whole file.
+    case "$ELF_READER_KIND" in
+    readelf)
+        # NOT strtonum(): that is a gawk extension, and CI's awk is mawk, where
+        # it is undefined -- the sum would silently be 0 and this gate would
+        # pass vacuously on exactly the artifacts it exists to catch. Emit the
+        # hex MemSiz fields and convert in the shell.
+        total=0
+        for hex in $("$ELF_READER" -lW "$1" 2>/dev/null |
+            awk '/^  LOAD/ && $0 ~ /R E/ { print $6 }'); do
+            total=$((total + 16#${hex#0x}))
+        done
+        echo "$total"
+        ;;
+    objdump)
+        echo unsupported
+        ;;
+    esac
+}
+
 gnu_stack_flags() {
     case "$ELF_READER_KIND" in
     readelf)
@@ -165,6 +193,62 @@ gnu_stack_flags() {
                                    if ($i == "flags") { print $(i + 1); exit } }'
         ;;
     esac
+}
+
+# Echoes "<start-dec> <end-dec>" of the PT_GNU_RELRO window, empty if the
+# segment is absent, "unsupported" if the resolved reader cannot report it.
+# The hex→decimal conversion happens in the shell for the same reason
+# exec_load_bytes does it there: strtonum() is a gawk extension and CI's awk is
+# mawk, where it is undefined and the arithmetic would silently be 0.
+relro_range() {
+    case "$ELF_READER_KIND" in
+    readelf)
+        "$ELF_READER" -lW "$1" 2>/dev/null |
+            awk '/GNU_RELRO/ { print $3, $6; exit }' |
+            while read -r vaddr memsz; do
+                start=$((16#${vaddr#0x}))
+                echo "$start $((start + 16#${memsz#0x}))"
+            done
+        ;;
+    objdump)
+        echo unsupported
+        ;;
+    esac
+}
+
+# Echoes "<name> <start-dec> <end-dec>" for every GOT section, one per line.
+# The leading "[ 5]" index column is stripped BEFORE awk splits the line: its
+# width changes with the section count, so field numbers would otherwise shift
+# between binaries and the addresses would be read out of the wrong columns.
+got_sections() {
+    "$ELF_READER" -SW "$1" 2>/dev/null |
+        sed -e 's/^[[:space:]]*\[[[:space:]]*[0-9]*\][[:space:]]*//' |
+        awk '$1 ~ /^\.got/ && $3 ~ /^[0-9a-fA-F]+$/ && $5 ~ /^[0-9a-fA-F]+$/ { print $1, $3, $5 }' |
+        while read -r name addr size; do
+            start=$((16#$addr))
+            echo "$name $start $((start + 16#$size))"
+        done
+}
+
+# static | now | lazy — how the binary binds at load time.
+# Both tests are awk, not `grep -q`: grep exits on its first match, the reader
+# upstream takes EPIPE, and under `set -o pipefail` the satisfied case would be
+# reported as the failing one. awk consumes its whole input and cannot do that.
+bind_now_state() {
+    if ! "$ELF_READER" -lW "$1" 2>/dev/null |
+        awk '$1 == "DYNAMIC" { found = 1 } END { exit !found }'; then
+        echo static
+        return 0
+    fi
+    if "$ELF_READER" -dW "$1" 2>/dev/null |
+        awk '/\(BIND_NOW\)/                 { found = 1 }
+             /\(FLAGS\)/ && /BIND_NOW/      { found = 1 }
+             /\(FLAGS_1\)/ && / NOW([ ]|$)/ { found = 1 }
+             END { exit !found }'; then
+        echo now
+    else
+        echo lazy
+    fi
 }
 
 # ── Reporting ───────────────────────────────────────────────────────
@@ -217,8 +301,8 @@ skipped_files=0
 
 check_file() {
     file="$1"
-    # Two path components: both variants ship a binary literally named
-    # "codebase-memory-mcp", so the parent directory is what tells them apart.
+    # Two path components: the binary is literally named
+    # "codebase-memory-mcp", so the parent directory disambiguates the log.
     token=$(printf '%s' "$file" | awk -F/ '{ if (NF > 1) print $(NF - 1) "/" $NF; else print $NF }')
     fmt=$(detect_format "$file")
     if [ "$fmt" = other ]; then
@@ -227,24 +311,7 @@ check_file() {
         return 0
     fi
 
-    is_ui=0
-    case "$VARIANT" in
-    ui) is_ui=1 ;;
-    standard) is_ui=0 ;;
-    auto)
-        # The UI archive is codebase-memory-mcp-ui-<os>-<arch>, but the binary
-        # inside it is just "codebase-memory-mcp" — so the whole path decides,
-        # not the basename. Printed below so a misclassified path is visible in
-        # the log instead of silently disarming the UI assertion.
-        case "$file" in
-        *-ui | *-ui.* | *-ui-* | *-ui/*) is_ui=1 ;;
-        esac
-        ;;
-    esac
-
-    variant_label=standard
-    [ "$is_ui" -eq 1 ] && variant_label='UI (A5-no-ui-http not applicable)'
-    printf '\n── %s [%s, %s] ──\n' "$token" "$fmt" "$variant_label"
+    printf '\n── %s [%s] ──\n' "$token" "$fmt"
     checked_files=$((checked_files + 1))
 
     # A0 — anti-vacuity canary; every assertion below is an absence check.
@@ -253,8 +320,8 @@ check_file() {
         'this is not one of our artifacts, or its strings are unreadable (packed/compressed/truncated) — every absence assertion below would pass vacuously'
 
     # A1 — executable stack (ELF only). Every Linux artifact of v0.9.1-rc.1
-    # shipped GNU_STACK RWE: a writable+executable stack, which no modern
-    # binary has and which any classifier weighs heavily.
+    # shipped GNU_STACK RWE. A writable+executable stack is unnecessary here
+    # and weakens exploit mitigations, independently of any scanner verdict.
     if [ "$fmt" = elf ]; then
         if ! resolve_elf_reader; then
             echo "FAIL: no readelf/llvm-readelf/objdump available; cannot assert" \
@@ -280,22 +347,140 @@ check_file() {
         printf 'n/a  %-22s %s: executable-stack check is ELF-only\n' A1-noexec-stack "$token"
     fi
 
+
+    # A1b — read-only DATA must not live in the executable mapping. GNU ld
+    # enables -z separate-code by default on x86-64 but NOT on aarch64, so the
+    # arm64 binaries shipped ONE R E PT_LOAD spanning the whole image: 259 MB of
+    # tree-sitter parse tables mapped executable while amd64 mapped the same
+    # bytes R only. Section flags said A, not AX -- the kernel applies SEGMENT
+    # permissions, so section flags were never the control. Heuristic on
+    # purpose: if executable segments cover most of the file, .rodata is in them.
+    if [ "$fmt" = elf ]; then
+        exec_bytes=$(exec_load_bytes "$file")
+        file_bytes=$(wc -c < "$file" | tr -d ' ')
+        if [ "$exec_bytes" = unsupported ]; then
+            printf 'n/a  %-22s %s: %s cannot report segment sizes\n' \
+                A1b-rodata-noexec "$token" "$ELF_READER_KIND"
+        elif [ "${exec_bytes:-0}" -gt 0 ] && [ "$file_bytes" -gt 0 ] &&
+            [ $((exec_bytes * 100 / file_bytes)) -gt 60 ]; then
+            report FAIL A1b-rodata-noexec "$token" \
+                "executable PT_LOAD segments cover $((exec_bytes * 100 / file_bytes))% of the file ($exec_bytes/$file_bytes bytes) — read-only data is mapped executable (link with -z separate-code)"
+        else
+            report PASS A1b-rodata-noexec "$token" \
+                "executable PT_LOAD segments cover $((exec_bytes * 100 / file_bytes))% of the file (read-only data is outside them)"
+        fi
+    else
+        printf 'n/a  %-22s %s: segment-permission check is ELF-only\n' A1b-rodata-noexec "$token"
+    fi
+
+    # A1c — RELRO. PT_GNU_RELRO is the window the loader re-maps read-only once
+    # startup relocation is done. Without it .init_array, .fini_array,
+    # .data.rel.ro and the GOT stay writable for the whole process lifetime,
+    # which is what turns a stray write into control-flow hijack. ELF-only:
+    # Mach-O and PE have no equivalent segment.
+    relro_window=''
+    if [ "$fmt" = elf ]; then
+        relro_window=$(relro_range "$file")
+        if [ "$relro_window" = unsupported ]; then
+            printf 'n/a  %-22s %s: %s cannot report segment addresses\n' \
+                A1c-relro "$token" "$ELF_READER_KIND"
+        elif [ -z "$relro_window" ]; then
+            report FAIL A1c-relro "$token" \
+                "no PT_GNU_RELRO program header — .data.rel.ro and the GOT stay writable for the process lifetime (link with -z relro)"
+        else
+            report PASS A1c-relro "$token" \
+                "PT_GNU_RELRO covers $((${relro_window##* } - ${relro_window%% *})) bytes"
+        fi
+    else
+        printf 'n/a  %-22s %s: RELRO is a GNU/ELF segment\n' A1c-relro "$token"
+    fi
+
+    # A1d — eager binding, asserted on the OUTCOME instead of on the flag.
+    # -z now is what folds .got.plt into the RELRO window, but "the linker
+    # accepted -z now" proves nothing about the artifact, so what is measured
+    # here is the property itself: no GOT slot may be writable after startup,
+    # i.e. every .got* section must lie inside A1c's window.
+    #
+    # That is not a formality on the shipped artifact. The Linux release
+    # binaries are linked -static, and a static link on Ubuntu 24.04 / ld 2.42
+    # emits PT_GNU_RELRO yet places .got.plt immediately PAST its end: in our
+    # own release-shape binary .got.plt ran 0x11d9ffe8+0x40 against a window
+    # ending at 0x11DA0000, so 40 bytes of GOT stayed writable for the process
+    # lifetime. This assertion fails on that binary and passes on the one built
+    # with -z now, which is the only reason to believe it measures anything.
+    #
+    # A binary with a PT_DYNAMIC is additionally required to carry
+    # BIND_NOW/FLAGS_1 NOW, because there RELRO alone cannot help: lazy binding
+    # writes the GOT after the loader has already re-protected it. A static
+    # binary has no PT_DYNAMIC and nothing to bind at runtime, so GOT coverage
+    # is the whole property there — a distinct reported outcome, never a skip.
+    #
+    # Scope: this is a property of the RELEASE link (-z now in Makefile.cbm).
+    # Contract tests hand the gate a stub compiled straight from a .c file to
+    # exercise packaging, format detection and the needle scans; a stub is not
+    # linked with -z now and never ships, so asserting eager binding on it
+    # tests the fixture's compiler defaults, not the artifact. Such a caller
+    # declares itself with CBM_COMPOSITION_FIXTURE=1 and A1d is reported n/a —
+    # a named exemption, printed on every run, never a silent skip. Every
+    # other assertion still runs on the fixture unchanged.
+    if [ "${CBM_COMPOSITION_FIXTURE:-0}" = 1 ]; then
+        printf 'n/a  %-22s %s: packaging fixture (CBM_COMPOSITION_FIXTURE=1) — eager binding is asserted on release links only\n' \
+            A1d-bind-now "$token"
+    elif [ "$fmt" != elf ]; then
+        printf 'n/a  %-22s %s: BIND_NOW is an ELF dynamic-section property\n' \
+            A1d-bind-now "$token"
+    elif [ "$relro_window" = unsupported ]; then
+        printf 'n/a  %-22s %s: %s cannot report section addresses\n' \
+            A1d-bind-now "$token" "$ELF_READER_KIND"
+    elif [ -z "$relro_window" ]; then
+        report FAIL A1d-bind-now "$token" \
+            "no PT_GNU_RELRO, so no GOT section can be read-only after relocation (see A1c)"
+    else
+        relro_start=${relro_window%% *}
+        relro_end=${relro_window##* }
+        got_seen=0
+        got_writable=''
+        while read -r got_name got_start got_end; do
+            [ -z "$got_name" ] && continue
+            got_seen=$((got_seen + 1))
+            if [ "$got_start" -lt "$relro_start" ] || [ "$got_end" -gt "$relro_end" ]; then
+                got_writable="$got_writable $got_name"
+            fi
+        done <<EOF
+$(got_sections "$file")
+EOF
+        bind_state=$(bind_now_state "$file")
+        if [ "$got_seen" -eq 0 ]; then
+            # Same anti-vacuity rule as A0: with no GOT section to place, the
+            # coverage test above is trivially satisfied and would read green.
+            report FAIL A1d-bind-now "$token" \
+                "no .got* section found ($ELF_READER) — the coverage test has nothing to check and would pass vacuously; section headers may have been removed"
+        elif [ -n "$got_writable" ]; then
+            report FAIL A1d-bind-now "$token" \
+                "GOT section(s)$got_writable fall outside PT_GNU_RELRO [$relro_start,$relro_end) — they stay WRITABLE after relocation (link with -z now)"
+        elif [ "$bind_state" = lazy ]; then
+            report FAIL A1d-bind-now "$token" \
+                "dynamic binary with neither BIND_NOW nor FLAGS_1 NOW — the GOT is filled lazily, after the loader has already applied RELRO (link with -z now)"
+        elif [ "$bind_state" = static ]; then
+            report PASS A1d-bind-now "$token" \
+                "$got_seen GOT section(s) inside PT_GNU_RELRO; no PT_DYNAMIC, so nothing binds at runtime"
+        else
+            report PASS A1d-bind-now "$token" \
+                "$got_seen GOT section(s) inside PT_GNU_RELRO and the dynamic section requests BIND_NOW"
+        fi
+    fi
+
     # A2 — test-only seams.
     for needle in "${SEAM_NEEDLES[@]}"; do
         assert_absent "$file" "$token" A2-no-test-seams "$needle"
     done
     # Sweep for seams nobody thought to pin: a new CBM_TEST_* env var added to
     # production code lands here on its first release, not on the next audit.
-    # Two seams remain in release artifacts BY DECISION, so the wildcard is an
-    # allowlist rather than a blanket ban: scripts/smoke-test.sh runs against the
-    # real release artifact, and these are what let it do so honestly —
-    # CRASH_ON/HANG_ON inject the faults that prove supervisor recovery, and
-    # WINDOWS_USER_PATH_RUN_ID is what stops the PATH smoke from writing the
-    # tester's actual PATH. Deleting them would trade genuine release-artifact
-    # coverage for a cosmetic win. Anything NOT on this list is a novel seam and
-    # fails, which is the property that matters: the list can only shrink by
-    # decision, never grow by accident.
-    seam_allowed='CBM_TEST_CRASH_ON CBM_TEST_HANG_ON CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
+    # One narrowly validated seam remains in Windows release artifacts by
+    # decision: WINDOWS_USER_PATH_RUN_ID redirects the artifact smoke away from
+    # the tester's actual user PATH. Crash/hang injectors are test-build-only and
+    # are explicitly forbidden above. Anything else is novel and fails.
+    seam_allowed='CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
     seam_unexpected=''
     for found in $(LC_ALL=C grep -a -o -E 'CBM_TEST_[A-Za-z0-9_]+' "$file" 2>/dev/null |
         sort -u || true); do
@@ -320,9 +505,9 @@ check_file() {
     for needle in "${SQLITE_LOADEXT_NEEDLES[@]}"; do
         assert_absent "$file" "$token" A4-no-sqlite-loadext "$needle"
     done
-    # Positive control for A4: the three needles above are all *absent* on a
-    # stripped build even when the feature is compiled in, so on its own that
-    # assertion can pass vacuously. SQLite's own compile-option table names
+    # Positive control for A4: the symbol needles can be absent on a stripped
+    # candidate even when the feature is compiled in, so that candidate's
+    # absence assertion can pass vacuously. SQLite's own compile-option table names
     # every OMIT_* it was built with — when that table is present (it ships
     # unless SQLITE_OMIT_COMPILEOPTION_DIAGS is set) it proves the omission
     # positively rather than by absence.
@@ -335,37 +520,16 @@ check_file() {
             "sqlite compile-option table absent; A4 rests on absence needles only"
     fi
 
-    # A5 — UI/HTTP subsystem, standard artifacts only.
-    #
-    # NOT YET ENFORCED. src/ui/{config,http_server,layout3d,httpd,embedded_stub}.c
-    # are still in PROD_SRCS, and the standard build merely substitutes empty
-    # embedded assets — so the HTTP server and its popen("ps … | grep") process
-    # enumerator are linked into artifacts that can never serve a UI. Excluding
-    # them is a real refactor: four files outside src/ui (src/main.c,
-    # src/daemon/host.c, src/daemon/application.c, src/mcp/index_supervisor.c)
-    # reference UI symbols, including the daemon that serves the UI.
-    #
-    # Until that lands, this assertion reports rather than fails. A gate everyone
-    # knows is red teaches people to ignore gates, and a known-failing check has
-    # no more enforcement value than this note — but the needles are kept live and
-    # exercised so that the day the split lands, flipping CBM_CHECK_UI_ABSENT=1
-    # (then making it the default) is a one-line change and not a rewrite.
-    if [ "$is_ui" -eq 1 ]; then
-        printf 'n/a  %-22s %s: UI artifact, HTTP server ships here by design\n' \
-            A5-no-ui-http "$token"
-    elif [ "${CBM_CHECK_UI_ABSENT:-0}" = "1" ]; then
+    # A5 — UI/HTTP subsystem. One composition ships and it serves the graph UI
+    # from embedded assets, so the HTTP server belongs here by construction.
+    # CBM_CHECK_UI_ABSENT=1 still enforces absence for any future headless build.
+    if [ "${CBM_CHECK_UI_ABSENT:-0}" = "1" ]; then
         for needle in "${UI_HTTP_NEEDLES[@]}"; do
             assert_absent "$file" "$token" A5-no-ui-http "$needle"
         done
     else
-        ui_hits=0
-        for needle in "${UI_HTTP_NEEDLES[@]}"; do
-            if LC_ALL=C grep -a -q -F -e "$needle" "$file"; then
-                ui_hits=$((ui_hits + 1))
-            fi
-        done
-        printf 'INFO %-22s %s: %d/%d UI/HTTP needles present (no-UI split pending; set CBM_CHECK_UI_ABSENT=1 to enforce)\n' \
-            A5-no-ui-http "$token" "$ui_hits" "${#UI_HTTP_NEEDLES[@]}"
+        printf 'n/a  %-22s %s: UI-capable artifact, HTTP server ships here by design\n' \
+            A5-no-ui-http "$token"
     fi
 }
 

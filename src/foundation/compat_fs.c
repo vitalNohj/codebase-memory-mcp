@@ -23,11 +23,13 @@
 #include <windows.h>
 
 #include <aclapi.h>
-#include <direct.h> /* _wmkdir */
-#include <errno.h>  /* errno for spawn-failure logging */
-#include <fcntl.h>  /* _O_RDONLY */
-#include <io.h>     /* _wunlink, _open_osfhandle, _close */
-#include <stdint.h> /* intptr_t */
+#include <direct.h>   /* _wmkdir */
+#include <errno.h>    /* errno for spawn-failure logging */
+#include <fcntl.h>    /* _O_RDONLY */
+#include <io.h>       /* _wunlink, _open_osfhandle, _close */
+#include <share.h>    /* _SH_DENYRW */
+#include <sys/stat.h> /* _S_IREAD */
+#include <stdint.h>   /* intptr_t */
 #include "foundation/log.h"
 #include "foundation/win_utf8.h"
 
@@ -123,17 +125,20 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     WIN32_FILE_ATTRIBUTE_DATA data;
     BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    DWORD path_error = ok ? ERROR_SUCCESS : GetLastError();
     free(wpath);
     if (!ok) {
-        return CBM_NOT_FOUND;
+        return path_error == ERROR_FILE_NOT_FOUND || path_error == ERROR_PATH_NOT_FOUND
+                   ? CBM_PATH_INFO_ABSENT
+                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -154,7 +159,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
         written >= windows_to_unix_ticks
             ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
             : 0;
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -310,8 +315,9 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE,
+                                 EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL,
+                                 &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
             *gle = GetLastError();
@@ -510,15 +516,28 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    size_t start = wlen > 0U && (tmp[0] == L'/' || tmp[0] == L'\\') ? 1U : 0U;
-    if (wlen >= 3U && tmp[1] == L':' && (tmp[2] == L'/' || tmp[2] == L'\\')) {
+    size_t start = wlen > 0U && cbm_win_path_separator(tmp[0]) ? 1U : 0U;
+    if (wlen >= 8U && _wcsnicmp(tmp, L"\\\\?\\UNC\\", 8U) == 0) {
+        /* Extended UNC roots are \\?\UNC\server\share\. Neither the server
+         * nor share component is creatable; begin with the first descendant. */
+        size_t separators = 0U;
+        start = 8U;
+        while (start < wlen && separators < 2U) {
+            if (cbm_win_path_separator(tmp[start])) {
+                separators++;
+            }
+            start++;
+        }
+    } else if (wlen >= 7U && wcsncmp(tmp, L"\\\\?\\", 4U) == 0 && tmp[5] == L':' &&
+               cbm_win_path_separator(tmp[6])) {
+        start = 7U;
+    } else if (wlen >= 3U && tmp[1] == L':' && cbm_win_path_separator(tmp[2])) {
         start = 3U;
-    } else if (wlen >= 2U && (tmp[0] == L'/' || tmp[0] == L'\\') &&
-               (tmp[1] == L'/' || tmp[1] == L'\\')) {
+    } else if (wlen >= 2U && cbm_win_path_separator(tmp[0]) && cbm_win_path_separator(tmp[1])) {
         size_t separators = 0U;
         start = 2U;
         while (start < wlen && separators < 2U) {
-            if (tmp[start] == L'/' || tmp[start] == L'\\') {
+            if (cbm_win_path_separator(tmp[start])) {
                 separators++;
             }
             start++;
@@ -526,8 +545,8 @@ bool cbm_mkdir_p(const char *path, int mode) {
     }
     bool ok = true;
     for (wchar_t *p = tmp + start; ok && *p; p++) {
-        if (*p == L'/' || *p == L'\\') {
-            if (p == tmp || p[-1] == L'/' || p[-1] == L'\\') {
+        if (cbm_win_path_separator(*p)) {
+            if (p == tmp || cbm_win_path_separator(p[-1])) {
                 continue;
             }
             wchar_t separator = *p;
@@ -542,6 +561,13 @@ bool cbm_mkdir_p(const char *path, int mode) {
     free(tmp);
     free(wpath);
     return ok;
+}
+
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
+    /* The Windows walk has its own reparse-point policy (see
+     * cbm_windows_mkdir_component); the POSIX symlink policy does not apply. */
+    (void)policy;
+    return cbm_mkdir_p(path, mode);
 }
 
 int cbm_unlink(const char *path) {
@@ -562,6 +588,26 @@ int cbm_rmdir(const char *path) {
     int ret = _wrmdir(wpath);
     free(wpath);
     return ret;
+}
+
+int cbm_lockfile_open(const char *path, bool create) {
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        errno = EINVAL;
+        return -1;
+    }
+    int flags = _O_RDWR | _O_BINARY | _O_NOINHERIT | (create ? _O_CREAT : 0);
+    /* _SH_DENYRW: every other open of this file, from any process, fails
+     * with EACCES until this descriptor closes -- including at death. */
+    int fd = _wsopen(wpath, flags, _SH_DENYRW, _S_IREAD | _S_IWRITE);
+    free(wpath);
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)_close(fd);
+    }
 }
 
 /* Build a properly-quoted Windows command line from an argv array.
@@ -685,7 +731,14 @@ int cbm_exec_no_shell(const char *const *argv) {
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    /* CREATE_NO_WINDOW: the third and last spawn site that still needed it
+     * (#1427). Without it every helper routed through here — git, codesign,
+     * open — flashes a console window, and under a stdio MCP session with
+     * auto_watch those steal focus while the user is typing. The other three
+     * CreateProcessW sites already set it: subprocess.c and cbm_popen_isolated
+     * via #1448, and the detached daemon spawn in daemon/bootstrap.c, which has
+     * had it since it was written. */
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         free(cmdline);
         return CBM_NOT_FOUND;
     }
@@ -706,6 +759,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -774,11 +828,12 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     struct stat state;
     if (lstat(path, &state) != 0) {
-        return CBM_NOT_FOUND;
+        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_INFO_ABSENT
+                                                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_regular = S_ISREG(state.st_mode);
@@ -792,7 +847,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     out->mtime_ns =
         ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
 #endif
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -816,24 +871,131 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-static int cbm_open_directory_component(int parent, const char *component, int flags) {
+/* Symlink policy for the parent-chain walk. Every component is opened with
+ * O_NOFOLLOW; a symlink is followed only when its OWNER is trusted, never by
+ * default. Root-owned links are trusted everywhere (distro /home indirection,
+ * macOS /tmp: only root can create those, so they are outside the attacker
+ * model). A link owned by the invoking account is trusted only where the
+ * caller opted in with CBM_MKDIR_FOLLOW_OWNED: for a path rooted in the user's
+ * own configuration such a link is the user's own arrangement (a dotfile
+ * manager, ~/.config/opencode -> /mnt/...), and refusing it made every
+ * agent-config write under such a root fail with an opaque agent_config
+ * error. It is not trusted for a path derived from a repository, where git
+ * creates symlinks owned by whoever cloned, so "user-owned" says nothing about
+ * "user-intended". The rule is the one the Linux kernel's
+ * fs.protected_symlinks applies, and the ancestor policy the activation
+ * transaction already uses. A link owned by any OTHER account (planted in a
+ * group- or world-writable ancestor) stays refused, and a privileged walk
+ * (euid 0) still refuses user-owned links.
+ *
+ * Inspecting the link and following it are two steps, so what the follow
+ * lands on is checked as well: the opened target must be a directory owned by
+ * root or the invoking user, and not world-writable unless sticky. An account
+ * that can write the parent cannot steer the walk into a directory it
+ * controls or into one where anyone can pre-plant entries, and because the
+ * judgement and the follow are bound to one inode (cbm_read_trusted_link) it
+ * cannot substitute a link of its own between them either. */
+static bool cbm_walk_link_trusted(uid_t owner, bool follow_owned) {
+    return owner == 0U || (follow_owned && owner == geteuid());
+}
+
+static bool cbm_walk_target_trusted(const struct stat *target) {
+    bool trusted_owner = target->st_uid == 0U || target->st_uid == geteuid();
+    bool world_writable = (target->st_mode & S_IWOTH) != 0;
+    bool sticky = (target->st_mode & S_ISVTX) != 0;
+    return S_ISDIR(target->st_mode) && trusted_owner && (!world_writable || sticky);
+}
+
+/* Read the target text of the symlink at `component`, but only if the link's
+ * owner is trusted -- and read it from the SAME inode the judgement was made
+ * on. Judging by name and then opening by name is a check-then-use pair: an
+ * account that can write the parent could swap the entry in between, so the
+ * link that gets followed is never the one that was judged (demonstrated
+ * against an earlier head with an LD_PRELOAD shim). The link is therefore
+ * never opened by name after the judgement: on Linux an O_PATH|O_NOFOLLOW
+ * descriptor pins the inode, and both the fstat and the readlinkat operate on
+ * it; elsewhere the link is stat'ed by name before and after the readlinkat
+ * and both must be the same inode with the same owner. What is followed
+ * afterwards is the text this function returns, resolved from the parent. */
+static bool cbm_read_trusted_link(int parent, const char *component, bool follow_owned, char *text,
+                                  size_t text_size) {
+    ssize_t length = 0; /* nothing read yet: refused below unless a read succeeds */
+#if defined(__linux__) && defined(O_PATH)
+    int link = openat(parent, component, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (link < 0) {
+        return false;
+    }
+    struct stat state;
+    if (fstat(link, &state) == 0 && S_ISLNK(state.st_mode) &&
+        cbm_walk_link_trusted(state.st_uid, follow_owned)) {
+        /* An empty path names the link the descriptor itself refers to. */
+        length = readlinkat(link, "", text, text_size);
+    }
+    (void)close(link);
+#else
+    struct stat before;
+    struct stat after;
+    if (fstatat(parent, component, &before, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(before.st_mode) ||
+        !cbm_walk_link_trusted(before.st_uid, follow_owned)) {
+        return false;
+    }
+    length = readlinkat(parent, component, text, text_size);
+    if (fstatat(parent, component, &after, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(after.st_mode) ||
+        after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+        after.st_uid != before.st_uid) {
+        return false;
+    }
+#endif
+    /* Empty or truncated text is refused rather than guessed at. */
+    if (length <= 0 || (size_t)length >= text_size) {
+        return false;
+    }
+    text[length] = '\0';
+    return true;
+}
+
+static int cbm_open_directory_component(int parent, const char *component, int flags,
+                                        bool follow_owned) {
     int descriptor = openat(parent, component, flags);
 #if defined(O_NOFOLLOW) && defined(AT_SYMLINK_NOFOLLOW)
     if (descriptor < 0) {
-        struct stat state;
-        if (fstatat(parent, component, &state, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(state.st_mode) && state.st_uid == 0U) {
-            descriptor = openat(parent, component, flags & ~O_NOFOLLOW);
+        /* The caller decides on errno from the FIRST open (ENOENT means
+         * "create it"); a refused link must not leak a later call's errno. */
+        int open_errno = errno;
+        char text[CBM_SZ_4K];
+        if (cbm_read_trusted_link(parent, component, follow_owned, text, sizeof(text))) {
+            /* The judged link's own text, resolved from the parent exactly as
+             * the kernel would resolve it (relative texts against the link's
+             * directory). Links inside the text are resolved by the kernel as
+             * before; the target check bounds where the walk lands. */
+            int followed = openat(parent, text, flags & ~O_NOFOLLOW);
+            struct stat target;
+            if (followed >= 0 && fstat(followed, &target) == 0 &&
+                cbm_walk_target_trusted(&target)) {
+                descriptor = followed;
+            } else if (followed >= 0) {
+                (void)close(followed);
+            }
+        }
+        if (descriptor < 0) {
+            errno = open_errno;
         }
     }
+#else
+    (void)follow_owned;
 #endif
     return descriptor;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
+    return cbm_mkdir_p_ex(path, mode, 0U);
+}
+
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
     if (!path || path[0] == '\0') {
         return false;
     }
+    bool follow_owned = (policy & CBM_MKDIR_FOLLOW_OWNED) != 0U;
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
@@ -866,12 +1028,12 @@ bool cbm_mkdir_p(const char *path, int mode) {
             *separator = '\0';
         }
         if (cursor[0] != '\0' && strcmp(cursor, ".") != 0) {
-            int next = cbm_open_directory_component(directory, cursor, flags);
+            int next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
             if (next < 0 && errno == ENOENT) {
                 if (mkdirat(directory, cursor, (mode_t)mode) != 0 && errno != EEXIST) {
                     ok = false;
                 } else {
-                    next = cbm_open_directory_component(directory, cursor, flags);
+                    next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
                 }
             }
             if (ok && next < 0) {
@@ -902,6 +1064,34 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_lockfile_open(const char *path, bool create) {
+    int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (create ? O_CREAT : 0);
+    int fd;
+    do {
+        fd = open(path, flags, S_IRUSR | S_IWUSR);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc;
+    do {
+        rc = flock(fd, LOCK_EX | LOCK_NB);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)close(fd);
+    }
 }
 
 int cbm_exec_no_shell(const char *const *argv) {
@@ -1018,9 +1208,54 @@ int cbm_rename_replace(const char *src, const char *dst) {
     wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-                  ? 0
-                  : CBM_NOT_FOUND;
+        if (MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            ret = 0;
+        } else {
+            /* Translate the Win32 error into errno so callers can report WHY.
+             *
+             * Callers log `errno` after a failed rename (see
+             * finalize.rename_failed in the pipeline). Without this the value
+             * is whatever happened to be left there by an unrelated CRT call,
+             * so on Windows the one field that should explain an atomic-publish
+             * failure was noise. #1620 is exactly that: an ACL problem surfaced
+             * to the user as "Pipeline failed. Check repo_path exists and
+             * contains source files" — blaming their repository — because
+             * ERROR_ACCESS_DENIED never reached the log.
+             *
+             * ERROR_ACCESS_DENIED is the interesting one here: MoveFileEx needs
+             * DELETE on the destination, which a cache file created under an
+             * empty or foreign DACL does not grant. */
+            DWORD error = GetLastError();
+            switch (error) {
+            case ERROR_ACCESS_DENIED:
+            case ERROR_WRITE_PROTECT:
+                errno = EACCES;
+                break;
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+                errno = ENOENT;
+                break;
+            case ERROR_SHARING_VIOLATION:
+            case ERROR_LOCK_VIOLATION:
+            case ERROR_USER_MAPPED_FILE:
+                errno = EBUSY;
+                break;
+            case ERROR_NOT_SAME_DEVICE:
+                errno = EXDEV;
+                break;
+            case ERROR_DISK_FULL:
+                errno = ENOSPC;
+                break;
+            case ERROR_INVALID_NAME:
+            case ERROR_FILENAME_EXCED_RANGE:
+                errno = ENAMETOOLONG;
+                break;
+            default:
+                errno = EIO;
+                break;
+            }
+            ret = CBM_NOT_FOUND;
+        }
     }
     free(wsrc);
     free(wdst);
@@ -1035,8 +1270,8 @@ int cbm_rename_noreplace(const char *src, const char *dst) {
         return CBM_NOT_FOUND;
     }
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_path_to_wide(src);
+    wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
         ret = MoveFileExW(wsrc, wdst, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)

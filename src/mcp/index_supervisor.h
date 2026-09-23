@@ -49,11 +49,42 @@ bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 size_t cbm_index_worker_memory_budget_bytes(void);
 
+/* Event name of the worker log's startup header. Shared with the tests so the
+ * contract has exactly one spelling. */
+#define CBM_INDEX_WORKER_LOG_START_EVENT "index.worker.start"
+
+/* Worker-side: open the worker log for post-mortem use. Call this FIRST in a
+ * process admitted by the worker argv grammar, before any indexing work.
+ *
+ * Six reports (#1070, #1130, #1132, #1133, #1145, #1450) describe a worker that
+ * died and left a log of 0 bytes: nothing was ever flushed, so every one of them
+ * is unreproducible and unattributable. This makes the log always say something:
+ *   1. the stream becomes crash-durable (see cbm_log_set_crash_durable), so a
+ *      crash, a SIGKILL or a hang can no longer swallow what was written;
+ *   2. a startup header — version, build fingerprint, pid, repo path and the
+ *      worker's own arguments — is written and flushed synchronously, so even a
+ *      worker that dies before its first unit of work is identifiable.
+ *
+ * It fixes no crash. It converts an empty file into a report we can act on.
+ * Idempotent: the worker role is installed twice (process entry, then the CLI
+ * arg parser), and the header is written once. */
+void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
+
 /* Capture the exact executable-image fingerprint once, during process startup
  * before any worker can be launched. Repeated calls return the original capture
  * and never re-hash a pathname that an installer may since have replaced. */
 bool cbm_index_supervisor_capture_build_fingerprint(void);
 const char *cbm_index_supervisor_build_fingerprint(void);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test-only: the runner captures a synthetic stub (see the capture seam) so
+ * spawned workers start instantly, but a daemon runtime service can only carry
+ * the REAL image hash. A fixture that runs a real daemon and drives the
+ * production activation guard against it aligns the captured value with that
+ * hash for its duration and restores the previous value afterwards. Invalid
+ * input is ignored. Never compiled into production. */
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint);
+#endif
 
 typedef struct {
     const char *expected_build_fingerprint;
@@ -129,6 +160,10 @@ typedef enum {
     CBM_INDEX_WORKER_POLL_RUNNING = 0,
     CBM_INDEX_WORKER_POLL_TERMINAL = 1,
 } cbm_index_worker_poll_t;
+
+/* Pure Windows backstop policy, available on all platforms for regression tests.
+ * Small/zero budgets disable the OS cap, not the cooperative budget or containment. */
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes);
 
 /* Start returns after process creation. All string arguments are copied by the
  * contained subprocess layer. Recovery values are encoded only as hidden argv

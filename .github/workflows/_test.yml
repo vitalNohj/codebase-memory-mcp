@@ -101,11 +101,37 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      # Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1, which
+      # blocks unshare(CLONE_NEWUSER) for unprivileged users. Without this, the
+      # #1830 single-uid-userns smoke test SKIPS on every 24.04 leg, and its only
+      # real-namespace coverage lived on the two ubuntu-22.04 legs -- which are
+      # broad-matrix only (never PR CI) and which GitHub retires on 2027-04-17.
+      # A deliberate relaxation of a security check was therefore guarded by a
+      # test that ran in no PR and was on a clock. Hosted runners have
+      # passwordless sudo, so one sysctl puts it on the CORE matrix instead.
+      # Best-effort: a runner that refuses simply returns to skipping.
+      - name: Permit unprivileged user namespaces (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "could not lift the userns restriction; namespace tests will skip"
+          # Then SAY whether it worked. The runner prints per-shard aggregates
+          # ("N passed, M skipped") and never individual test names, so a
+          # namespace test that silently returns to skipping is invisible in a
+          # green log -- the same false assurance that let #1830 ship with a
+          # test that never executed. This line is the evidence. Probed exactly
+          # as the test does it: unprivileged, no sudo.
+          if unshare -U -r true 2>/dev/null; then
+            echo "CBM_USERNS_AVAILABLE=yes"
+          else
+            echo "CBM_USERNS_AVAILABLE=no (namespace-dependent tests will skip)"
+          fi
 
       - name: Install ccache (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -174,6 +200,37 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
 
+  # The package wrappers own their own runtime-set publication and lease-lock
+  # implementations. Run the same suites against both host families so Unix
+  # inode/flock behavior and Windows handle/link behavior are each gating,
+  # without adding Node/Go provisioning to every sanitizer/container leg.
+  test-package-wrappers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: pkg/go/go.mod
+          cache: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Test Go, npm, and PyPI runtime-set wrappers
+        shell: bash
+        run: scripts/ci/test-package-wrappers.sh
+
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
   # daemon-coordination paths) plus allocator concurrency all run under TSan
@@ -191,17 +248,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
 
-      - name: Install LLVM 22 (pinned diagnostic toolchain)
+      - name: Install LLVM 21 (pinned diagnostic toolchain)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update
-          sudo apt-get install -y clang-22
+          sudo apt-get install -y clang-21
 
       - name: Compiler cache (content-verified, restore)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -216,11 +273,11 @@ jobs:
       # lane: stack-use-after-return, stack-use-after-scope, and strict string
       # checks. Mirrors `make -f Makefile.cbm diag`, including its reasoning
       # for leaving detect_invalid_pointer_pairs out.
-      - name: Test (clang-22, ASan+UBSan + off-by-default ASan checks)
+      - name: Test (clang-21, ASan+UBSan + off-by-default ASan checks)
         env:
           ASAN_OPTIONS: "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1"
         run: |
-          scripts/test.sh CC=clang-22 CXX=clang++-22 \
+          scripts/test.sh CC=clang-21 CXX=clang++-21 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
 
       - name: Compiler cache (save)
@@ -254,7 +311,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Buildx cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -278,10 +335,16 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Pinned: the unversioned `llvm` formula tracks Homebrew stable, so the
+      # leg's compiler changed under us when stable moved 22 -> 23 (a new
+      # -Wunused-but-set-global under -Werror broke the build on whichever
+      # runner drew the 23 bottle, and passed on the ones that drew 22). A
+      # test verdict must be a function of the code, not of the image snapshot;
+      # moving to a newer major is a deliberate one-line bump here.
       - name: Install LSan-capable toolchain
-        run: brew install llvm ccache
+        run: brew install llvm@22 ccache
 
       - name: Compiler cache (content-verified, restore)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -296,7 +359,7 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
         run: |
-          LLVM_PREFIX="$(brew --prefix llvm)"
+          LLVM_PREFIX="$(brew --prefix llvm@22)"
           scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
 
       - name: Compiler cache (save)
@@ -317,7 +380,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps (Ubuntu)
         if: runner.os == 'Linux'
@@ -373,7 +436,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Defender posture: real-time protection is POLICY-LOCKED OFF on hosted
       # Windows images (verified 2026-07-27: WinDefend starts and
@@ -394,6 +457,7 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-ccache
             make
             git
+            zip
 
       - name: Create protected per-user temp root
         # One implementation, shared with _soak.yml and the VM leg
@@ -490,7 +554,7 @@ jobs:
       # The union proof lives in the canonical scripts/ci entry, not inline
       # YAML (venue-parity contract) — checkout (into repo/, so the manifest
       # download below stays untouched) provides the script.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: repo
 
@@ -502,7 +566,7 @@ jobs:
         run: repo/scripts/ci/verify-shard-union.sh manifests
 
   # Windows product-surface regression guards. Distinct from test-windows above
-  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
+  # (the sanitizer C suite): these drive a real product binary + external UI pack
   # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
   # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
   # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
@@ -513,7 +577,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -530,10 +594,6 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Test npm wrapper failure handling
-        working-directory: pkg/npm
-        run: npm test
-
       - name: Compiler cache (content-verified)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -543,11 +603,12 @@ jobs:
             ccache-guards-${{ github.ref }}-
             ccache-guards-
 
-      - name: Build product binary with embedded UI
+      - name: Build product binary with external UI assets and guard seams
         shell: msys2 {0}
-        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
-        # guard's HTTP UI is available. Functional gate only (no sanitizers).
-        run: scripts/build.sh --with-ui CC=clang CXX=clang++
+        # --with-ui builds the frontend and its content-addressed asset pack, so
+        # the drive-picker guard's HTTP UI is available. Functional gate only
+        # (no sanitizers).
+        run: scripts/build.sh --with-ui CC=clang CXX=clang++ TEST_SEAMS=1
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M

@@ -12,6 +12,7 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -29,6 +30,12 @@
 #include <unistd.h>
 #define worker_close close
 #define worker_getpid getpid
+#endif
+
+/* Same release-injected macro (and same fallback) main.c and cli.c use; the
+ * worker log's header must name the build the user actually ran. */
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
 #endif
 
 _Static_assert(CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE == CBM_DAEMON_BUILD_FINGERPRINT_SIZE,
@@ -84,6 +91,28 @@ size_t cbm_index_worker_memory_budget_bytes(void) {
     return g_worker_memory_budget_bytes;
 }
 
+/* Worker log startup header — see index_supervisor.h. */
+static atomic_flag g_worker_log_begun = ATOMIC_FLAG_INIT;
+
+void cbm_index_worker_log_begin(const char *args_json, const char *repo_path) {
+    /* Durability first, header second: if the header itself is the last thing
+     * this process ever manages to write, it must already be on disk. */
+    cbm_log_set_crash_durable(true);
+    if (atomic_flag_test_and_set_explicit(&g_worker_log_begun, memory_order_relaxed)) {
+        return; /* the CLI arg parser re-installs the worker role; header once */
+    }
+    char pid_text[CBM_SZ_32];
+    (void)snprintf(pid_text, sizeof(pid_text), "%ld", (long)worker_getpid());
+    const char *build = cbm_index_supervisor_build_fingerprint();
+    /* A control record, not an info line: a user who set CBM_LOG_LEVEL to warn
+     * or error would otherwise still hand us a 0-byte log, which is the whole
+     * defect. JSON-encoded, so a repo path with spaces or a quote survives. */
+    cbm_log_control(CBM_INDEX_WORKER_LOG_START_EVENT, "version", CBM_VERSION, "build",
+                    build ? build : "", "pid", pid_text, "repo_path", repo_path ? repo_path : "",
+                    "args", args_json ? args_json : "");
+    (void)fflush(stderr);
+}
+
 static bool worker_fingerprint_valid(const char *fingerprint);
 
 bool cbm_index_supervisor_capture_build_fingerprint(void) {
@@ -119,6 +148,16 @@ bool cbm_index_supervisor_capture_build_fingerprint(void) {
 const char *cbm_index_supervisor_build_fingerprint(void) {
     return g_build_fingerprint[0] ? g_build_fingerprint : NULL;
 }
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint) {
+    if (!fingerprint || !worker_fingerprint_valid(fingerprint)) {
+        return;
+    }
+    g_build_fingerprint_capture_attempted = true;
+    (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", fingerprint);
+}
+#endif
 
 static bool worker_fingerprint_valid(const char *fingerprint) {
     if (!fingerprint || strlen(fingerprint) != CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH) {
@@ -294,14 +333,23 @@ static bool supervisor_disable_requested(void) {
  * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
+    enum { MS_PER_SECOND = 1000 };
     char timeout_seconds[CBM_SZ_32] = {0};
+    long s = 0;
+    /* The upper test only stops the seconds-to-ms multiply from overflowing an
+     * int. It sets no policy: a longer timeout than the default is still fine. */
+    if (cbm_env_long("CBM_INDEX_WORKER_TIMEOUT_S", &s) && s > 0 && s <= INT_MAX / MS_PER_SECOND) {
+        return (int)(s * MS_PER_SECOND);
+    }
+    /* atol used to answer 0 for a value it could not read, and 0 fell straight
+     * through to the 15-minute default with nothing on screen. A test set to
+     * give up after 30 seconds then hung for 15 minutes and nobody could see
+     * why. An unreadable value now says so before it is dropped. */
     if (cbm_safe_getenv("CBM_INDEX_WORKER_TIMEOUT_S", timeout_seconds, sizeof(timeout_seconds),
                         NULL) &&
         timeout_seconds[0]) {
-        long s = atol(timeout_seconds);
-        if (s > 0) {
-            return (int)(s * 1000);
-        }
+        cbm_log_warn("index.supervisor.worker_timeout_ignored", "value", timeout_seconds, "action",
+                     "using_default");
     }
     return DEFAULT_QUIET_TIMEOUT_MS;
 }
@@ -526,7 +574,8 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
     if (have_cache) {
         char directory[INDEX_WORKER_PATH_CAP];
         written = snprintf(directory, sizeof(directory), "%s/logs", cache_copy);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
         written = snprintf(out, out_size, "%s/.worker-%s-XXXXXX", directory, kind);
@@ -560,6 +609,21 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     (void)snprintf(exit_text, sizeof(exit_text), "%d", handle->result.exit_code);
     cbm_log_info("index.supervisor.reap", "outcome", cbm_proc_outcome_str(handle->result.outcome),
                  "exit_code", exit_text, "signal", signal_text);
+    if (!worker_result_succeeded(&handle->result) &&
+        handle->process_result.job_memory_limit_bytes > 0) {
+        char limit_text[CBM_SZ_32];
+        char peak_text[CBM_SZ_32];
+        (void)snprintf(limit_text, sizeof(limit_text), "%zu",
+                       handle->process_result.job_memory_limit_bytes);
+        (void)snprintf(peak_text, sizeof(peak_text), "%zu",
+                       handle->process_result.peak_job_memory_bytes);
+        /* Peak accounting may include a denied allocation and exceed the cap,
+         * or remain below it. Report evidence, not an inferred OOM classification
+         * or a file to quarantine. */
+        cbm_log_warn("index.supervisor.worker_memory", "job_limit_bytes", limit_text,
+                     "peak_job_memory_bytes",
+                     handle->process_result.job_memory_available ? peak_text : "unavailable");
+    }
     if (handle->result.response_rejected) {
         cbm_log_error("index.supervisor.response_rejected", "reason", "payload_too_large", "log",
                       handle->log_path);
@@ -578,6 +642,26 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
                      cbm_proc_outcome_str(handle->result.outcome), "exit_code", exit_text, "log",
                      handle->log_path);
     }
+}
+
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
+    /* Tiny token budgets must still reach main (image/CRT/stack startup already
+     * needs memory). Keep their argv value but leave the OS cap disabled below
+     * 512 MiB. KILL_ON_JOB_CLOSE remains in force regardless of the cap.
+     *
+     * Windows charges job-wide COMMIT, not RSS. This 1.5x limit leaves room
+     * for the
+     * cooperative budget's recovery/abort gate, but an allocation can
+     * still be denied before
+     * the next cooperative check. It is a backstop for
+     * descendants too, not exact
+     * enforcement of the accounting budget. */
+    const size_t minimum_budget = (size_t)512U * 1024U * 1024U;
+    if (memory_budget_bytes < minimum_budget) {
+        return 0;
+    }
+    size_t headroom = memory_budget_bytes / 2;
+    return memory_budget_bytes > SIZE_MAX - headroom ? SIZE_MAX : memory_budget_bytes + headroom;
 }
 
 int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_bytes,
@@ -667,6 +751,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     options.on_log_line = NULL;
     options.log_ud = NULL;
     options.quiet_timeout_ms = worker_quiet_timeout_ms();
+    options.memory_limit_bytes = cbm_index_worker_job_memory_limit(memory_budget_bytes);
     options.delete_log_on_exit = false;
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);

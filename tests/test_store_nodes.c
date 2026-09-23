@@ -13,6 +13,17 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+typedef struct {
+    int calls;
+    int cancel_on_call;
+} file_outline_cancel_probe_t;
+
+static bool file_outline_cancel_probe(void *context) {
+    file_outline_cancel_probe_t *probe = context;
+    probe->calls++;
+    return probe->calls >= probe->cancel_on_call;
+}
+
 /* ── Label allowlist / SQL drift guard ──────────────────────────── */
 
 /* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
@@ -49,6 +60,36 @@ TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
     /* The callable fragment carries exactly Function and Method on top. */
     ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Function'"));
     ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Method'"));
+    PASS();
+}
+
+/* Same drift guard for the relation labels (Table/View — SQL data lineage).
+ * Relations are registry symbols but deliberately NOT type-like: the default
+ * cbm_registry_resolve vetoes them, so a code identifier sharing a table's
+ * name never binds into the lineage layer. */
+TEST(sql_relation_labels_match_cbm_label_is_relation) {
+    static const char *const relations[] = {"Table", "View", "Model"};
+    for (size_t i = 0; i < sizeof(relations) / sizeof(relations[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_relation(relations[i]));
+        ASSERT_TRUE(cbm_label_is_registry_symbol(relations[i]));
+        ASSERT_FALSE(cbm_label_is_type_like(relations[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", relations[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_RELATION_LABELS, quoted));
+        /* Relations must NOT ride in the callable/type fragments — the arch
+         * queries opt in explicitly by appending CBM_SQL_RELATION_LABELS. */
+        ASSERT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* cbm_label_is_registry_symbol covers exactly the seeded families. */
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Function"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Method"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Class"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Variable"));
+    ASSERT_TRUE(cbm_label_is_registry_symbol("Field"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("Module"));
+    ASSERT_FALSE(cbm_label_is_registry_symbol("File"));
+    ASSERT_FALSE(cbm_label_is_relation("Class"));
+    ASSERT_FALSE(cbm_label_is_relation(NULL));
     PASS();
 }
 
@@ -300,6 +341,156 @@ TEST(store_node_find_by_file) {
     PASS();
 }
 
+TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline", "/tmp/outline"), CBM_STORE_OK);
+
+    cbm_node_t nodes[] = {
+        {.project = "outline",
+         .label = "Method",
+         .name = "omega",
+         .qualified_name = "outline.main.omega",
+         .file_path = "main.c",
+         .start_line = 30,
+         .end_line = 33},
+        {.project = "outline",
+         .label = "Module",
+         .name = "main",
+         .qualified_name = "outline.main",
+         .file_path = "main.c",
+         .start_line = 1,
+         .end_line = 80},
+        {.project = "outline",
+         .label = "Function",
+         .name = "zeta",
+         .qualified_name = "outline.main.zeta",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 20},
+        {.project = "outline",
+         .label = "Function",
+         .name = "alpha",
+         .qualified_name = "outline.main.alpha",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 15},
+        {.project = "outline",
+         .label = "Class",
+         .name = "VisibleWithoutFilter",
+         .qualified_name = "outline.main.VisibleWithoutFilter",
+         .file_path = "main.c",
+         .start_line = 5,
+         .end_line = 40},
+        {.project = "outline",
+         .label = "Function",
+         .name = "other",
+         .qualified_name = "outline.other.other",
+         .file_path = "other.c",
+         .start_line = 1,
+         .end_line = 2},
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        ASSERT_GT(cbm_store_upsert_node(s, &nodes[i]), 0);
+    }
+
+    static const char *const labels[] = {"Function", "Method"};
+    cbm_file_outline_row_t *rows = NULL;
+    int count = 0;
+    int total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].name, "alpha");
+    ASSERT_STR_EQ(rows[1].name, "zeta");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 2, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0, 10, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 4);
+    ASSERT_EQ(count, 4);
+    ASSERT_STR_EQ(rows[0].name, "VisibleWithoutFilter");
+    ASSERT_STR_EQ(rows[1].name, "alpha");
+    ASSERT_STR_EQ(rows[2].name, "zeta");
+    ASSERT_STR_EQ(rows[3].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    file_outline_cancel_probe_t probe = {.cancel_on_call = 3};
+    rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    count = 99;
+    total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0,
+                                         file_outline_cancel_probe, &probe, &rows, &count, &total),
+              CBM_STORE_CANCELLED);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
+    ASSERT_TRUE(probe.calls >= 3);
+
+    const char *empty_label[] = {""};
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", empty_label, 1, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0,
+                                         CBM_STORE_FILE_OUTLINE_MAX_LIMIT + 1, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_outline_fails_closed_on_text_budget_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline-budget", "/tmp/outline-budget"), CBM_STORE_OK);
+
+    size_t qn_size = CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES + 64U;
+    char *large_qn = malloc(qn_size + 1U);
+    ASSERT_NOT_NULL(large_qn);
+    memset(large_qn, 'q', qn_size);
+    large_qn[qn_size] = '\0';
+    cbm_node_t node = {.project = "outline-budget",
+                       .label = "Function",
+                       .name = "oversized",
+                       .qualified_name = large_qn,
+                       .file_path = "large.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    free(large_qn);
+
+    cbm_file_outline_row_t *rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    int count = 99;
+    int total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline-budget", "large.c", NULL, 0, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_SCAN_LIMIT);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_not_found) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -544,8 +735,7 @@ TEST(store_lsp_surface_round_trip) {
     ASSERT_STR_EQ(rows[0].defs_json, "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]");
     ASSERT_STR_EQ(rows[0].config_ctx, "cfg-1");
     ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(bloom));
-    ASSERT_TRUE(rows[0].ref_bloom != NULL &&
-                memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
+    ASSERT_TRUE(rows[0].ref_bloom != NULL && memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
     ASSERT_STR_EQ(rows[1].rel_path, "pkg/b.go");
     ASSERT_STR_EQ(rows[1].defs_json, "[]");
     ASSERT_EQ(rows[1].ref_bloom_len, 0);
@@ -1262,6 +1452,48 @@ TEST(store_integrity_corrupt_too_many_rows) {
     }
     ASSERT_FALSE(cbm_store_check_integrity(s));
     cbm_store_close(s);
+    PASS();
+}
+
+/* ── Quarantine verdict (#1206, #1037) ──────────────────────────────
+ *
+ * The bool check above cannot answer the only question the quarantine path
+ * actually asks: "is this database damaged, or did I just lose a lock race?"
+ * Answering "damaged" to the second question is what made concurrent instances
+ * rename each other's HEALTHY databases to .corrupt (#1206). These bind the
+ * three-way verdict so that behaviour cannot come back. */
+
+TEST(store_integrity_verdict_healthy_is_ok) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "healthy-proj", "/tmp/healthy");
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_real_corruption_is_corrupt) {
+    /* Structural damage the shallow check can see: node IDs landing in
+     * root_path. This one MUST be quarantinable — a verdict that never says
+     * CORRUPT would protect broken databases instead of users. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('broken', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_CORRUPT);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt) {
+    /* A handle we could not open tells us NOTHING about the file's contents.
+     * Reporting CORRUPT here is how a database nobody could read got renamed
+     * and rebuilt from scratch (#1206) — the destructive answer to a question
+     * that was never asked. */
+    ASSERT_EQ(cbm_store_check_integrity_verdict(NULL), CBM_INTEGRITY_TRANSIENT);
     PASS();
 }
 
@@ -2136,6 +2368,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
+    RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
@@ -2144,6 +2377,9 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_verdict_healthy_is_ok);
+    RUN_TEST(store_integrity_verdict_real_corruption_is_corrupt);
+    RUN_TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt);
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
@@ -2152,6 +2388,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_node_find_by_file);
+    RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
+    RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);
     RUN_TEST(store_node_find_not_found);
     RUN_TEST(store_node_count_empty);
     RUN_TEST(store_node_delete_by_file);

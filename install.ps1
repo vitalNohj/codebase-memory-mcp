@@ -7,8 +7,22 @@
 
 $ErrorActionPreference = "Stop"
 
-# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects).
+#
+# TLS 1.3 is added ONLY where schannel can actually negotiate it: Windows 11 and
+# Server 2022 (build 20348+). On Windows 10 the enum value still exists from
+# .NET Framework 4.8 onward, so the assignment succeeds and nothing warns -- but
+# the handshake then fails outright with "The request was aborted: Could not
+# create SSL/TLS secure channel". An unsupported protocol flag in this bitmask
+# is a hard failure, not a graceful downgrade, so every Windows 10 user was
+# blocked at the first download (#1856). The enum-name probe additionally keeps
+# the script parsing on .NET Framework 4.7, where Tls13 is not defined at all.
+$CbmProtocols = [Net.SecurityProtocolType]::Tls12
+if ([Environment]::OSVersion.Version.Build -ge 20348 -and
+    ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13')) {
+    $CbmProtocols = $CbmProtocols -bor [Net.SecurityProtocolType]::Tls13
+}
+[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols
 Add-Type -AssemblyName System.Net.Http
 
 $Repo = "DeusData/codebase-memory-mcp"
@@ -87,12 +101,8 @@ function Invoke-CbmDownload {
     }
 }
 
-# Detect variant from args (--ui or --standard)
-$Variant = "standard"
 $SkipConfig = $false
 foreach ($arg in $args) {
-    if ($arg -eq "--ui") { $Variant = "ui" }
-    if ($arg -eq "--standard") { $Variant = "standard" }
     if ($arg -eq "--skip-config") { $SkipConfig = $true }
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
@@ -120,22 +130,52 @@ if ($env:CBM_ARCH) {
 }
 
 Write-Host "codebase-memory-mcp installer (Windows)"
-Write-Host "  variant: $Variant"
 Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
 # Build download URL
-if ($Variant -eq "ui") {
-    $Archive = "codebase-memory-mcp-ui-windows-$Arch.zip"
-} else {
-    $Archive = "codebase-memory-mcp-windows-$Arch.zip"
-}
+$Archive = "codebase-memory-mcp-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+
+# Give the staging directory a protected owner-only DACL.
+#
+# Without this it inherits whatever %TEMP% carries, and the binary we are about
+# to run from here validates its own directory and refuses inherited
+# cross-account mutation grants. That is not a hypothetical: sandboxed clients
+# leave ACEs on %TEMP% (a CodexSandboxUsers group, AppContainer SIDs, and
+# orphaned SIDs from uninstalled software have all been reported), and installs
+# failed with
+#   activation transaction I/O failed: acl-grants-cross-account-mutation to S-1-5-21-...
+# naming an ACE the installer itself inherited. See issues 1529, 1614 and 1571.
+#
+# cbm's own C staging already creates its directory this way; install.ps1 was
+# the one path that did not, which is why redirecting TMP/TEMP worked around it.
+#
+# Applied after creation rather than atomically on purpose: the overload that
+# takes a DirectorySecurity exists on Windows PowerShell 5.1 but not on
+# PowerShell 7, and Set-Acl works on both. The directory name is unpredictable
+# and nothing is written into it until the download below, so the window is not
+# usefully attackable.
+#
+# Best-effort: a filesystem that cannot carry a DACL must not fail the install.
+# If this does not take, the binary's own validation still refuses to proceed,
+# which is the honest outcome rather than a silent downgrade.
+try {
+    $stagingAcl = New-Object System.Security.AccessControl.DirectorySecurity
+    $stagingAcl.SetAccessRuleProtection($true, $false)
+    $stagingOwner = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+    $stagingAcl.SetOwner($stagingOwner)
+    $stagingAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $stagingOwner, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -Path $TmpDir -AclObject $stagingAcl -ErrorAction Stop
+} catch {
+    Write-Host "note: could not harden the staging directory ACL: $($_.Exception.Message)"
+}
 
 Write-Host "Downloading $Archive..."
 try {
@@ -255,8 +295,21 @@ if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
 }
 
 # Prove the downloaded binary runs before touching an existing installation.
+# PS 5.1 wraps redirected native stderr into ErrorRecords, so under the global
+# ErrorActionPreference=Stop a HEALTHY binary that prints one warning while
+# exiting 0 becomes a terminating error here. Relax to Continue for the probe
+# only; failure detection stays on $LASTEXITCODE, and the pre-seed guarantees
+# a binary that fails to START (stale $LASTEXITCODE from an earlier native
+# call) can never read as success.
 try {
-    $candidateVersion = & $DownloadedBinary --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $candidateVersion = & $DownloadedBinary --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -323,8 +376,18 @@ if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
 }
 
 # Verify
+# Same PS 5.1 stderr-wrapping guard as the candidate probe above; the pre-seed
+# matters MOST here, because prior successful native calls leave a stale
+# $LASTEXITCODE=0 that a start-failure would otherwise inherit.
 try {
-    $ver = & $Dest --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $ver = & $Dest --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {

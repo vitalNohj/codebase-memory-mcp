@@ -262,15 +262,23 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
+/* Upper bound on ORDER BY sort keys. Queries with more keys are rejected at
+ * parse time: an unmodeled key must be a loud error, never a silently dropped
+ * remainder (#1334 - the unconsumed tail swallowed the LIMIT clause). */
+#define CBM_CYPHER_ORDER_KEYS_MAX 8
+
 typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;             /* RETURN * */
-    const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
-    const char *order_dir; /* "ASC" or "DESC", NULL = default */
-    int skip;              /* SKIP N, 0 = none */
-    int limit;             /* 0 = default */
+    bool star; /* RETURN * */
+    /* ORDER BY key list, in priority order. Each key is "variable.property",
+     * "COUNT(var)" or an alias; direction is per key (Cypher semantics). */
+    const char *order_keys[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool order_descs[CBM_CYPHER_ORDER_KEYS_MAX]; /* false = ASC (default) */
+    int order_key_count;                         /* 0 = no ORDER BY */
+    int skip;                                    /* SKIP N, 0 = none */
+    int limit;                                   /* 0 = default */
 } cbm_return_clause_t;
 
 /* Full query AST */
@@ -313,6 +321,10 @@ typedef struct {
     /* rows[row_idx][col_idx] = string value */
     const char ***rows;
     int row_count;
+    /* True when an internal row/candidate ceiling prevented exhaustive
+     * evaluation. A Cypher LIMIT is part of query semantics and does not set
+     * this flag by itself. */
+    bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
     /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
